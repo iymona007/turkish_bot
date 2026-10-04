@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import logging
+import os
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import BotCommand, Update
 from telegram.ext import (
@@ -71,6 +74,35 @@ async def scheduler_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
     await context.application.bot_data["ctx"].delivery.run_scheduled(context.bot)
 
 
+class _Health(BaseHTTPRequestHandler):
+    """Hosting uchun: GET / so'roviga "ok" deb javob beradi."""
+
+    def _ok(self, body: bool = True) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        if body:
+            self.wfile.write(b"ok")
+
+    def do_GET(self) -> None:
+        self._ok()
+
+    def do_HEAD(self) -> None:
+        self._ok(body=False)
+
+    def log_message(self, *args) -> None:  # har so'rovni logga yozmaymiz
+        pass
+
+
+def start_health_server() -> None:
+    port = os.environ.get("PORT")
+    if not port:  # kompyuteringizda PORT yo'q: hech narsa ishga tushmaydi
+        return
+    server = HTTPServer(("0.0.0.0", int(port)), _Health)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    log.info("Health server %s portda ishga tushdi", port)
+
+
 def main() -> None:
     setup_logging()
     settings = load_settings()
@@ -112,6 +144,7 @@ def main() -> None:
         raise RuntimeError('JobQueue yo\'q: pip install "python-telegram-bot[job-queue]"')
     app.job_queue.run_repeating(scheduler_tick, interval=60, first=10, name="daily-delivery")
 
+    start_health_server()
     app.run_polling(allowed_updates=["message", "callback_query"])
 
 
