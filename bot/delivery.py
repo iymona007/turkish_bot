@@ -19,7 +19,7 @@ from .words import WordService
 
 log = logging.getLogger(__name__)
 
-RETRY_COOLDOWN = 15 * 60  # soniya: so'z topilmagan yoki xato bo'lsa, qayta urinish oralig'i
+RETRY_COOLDOWN = 15 * 60
 
 
 class DeliveryService:
@@ -30,19 +30,32 @@ class DeliveryService:
         self._locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._cooldown: dict[int, float] = {}
 
-    async def deliver(self, bot: Bot, chat_id: int, *, scheduled: bool = False) -> bool:
-        """Bugungi so'zlarni yuboradi. So'zlar yuborilgan bo'lsa True qaytaradi."""
+    async def deliver(
+        self,
+        bot: Bot,
+        chat_id: int,
+        *,
+        scheduled: bool = False,
+    ) -> bool:
+        """Bugungi so'zlarni yuboradi."""
+
         async with self._locks[chat_id]:
             user = await self._db.get_user(chat_id)
+
             if user is None:
                 return False
 
             today = datetime.now(self._s.tz).date()
             today_iso = today.isoformat()
 
-            words = await self._db.todays_words(chat_id, today_iso)
+            words = await self._db.todays_words(
+                chat_id,
+                today_iso,
+            )
+
             if not words:
                 fresh = await self._words.pick_new(user)
+
                 if fresh:
                     await self._db.introduce(
                         chat_id,
@@ -50,25 +63,42 @@ class DeliveryService:
                         today_iso,
                         srs.first_review(today).isoformat(),
                     )
-                    words = await self._db.todays_words(chat_id, today_iso)
+
+                    words = await self._db.todays_words(
+                        chat_id,
+                        today_iso,
+                    )
 
             if not words:
                 if not scheduled:
                     await bot.send_message(
-                        chat_id, "Hozircha yangi so'z topilmadi. Birozdan keyin /soz ni qayta yuboring."
+                        chat_id,
+                        "Hozircha yangi so'z topilmadi. "
+                        "Birozdan keyin /soz ni qayta yuboring.",
                     )
+
                 return False
 
+            # Bugungi so'zlarni yuborish
             await bot.send_message(
                 chat_id,
                 fmt.words_message(words),
                 parse_mode=ParseMode.HTML,
                 reply_markup=fmt.words_keyboard(words),
             )
-            # Qayta yuborilib ketmasligi uchun belgini darhol qo'yamiz.
-            await self._db.set_user_field(chat_id, last_sent_date=today_iso)
 
-            due = await self._db.count_due(chat_id, today_iso)
+            # Qayta yuborilmasligi uchun belgilanadi
+            await self._db.set_user_field(
+                chat_id,
+                last_sent_date=today_iso,
+            )
+
+            # Takrorlash kerak bo'lgan so'zlar
+            due = await self._db.count_due(
+                chat_id,
+                today_iso,
+            )
+
             if due:
                 await bot.send_message(
                     chat_id,
@@ -76,26 +106,85 @@ class DeliveryService:
                     parse_mode=ParseMode.HTML,
                     reply_markup=fmt.review_keyboard(due),
                 )
+
             return True
 
     async def run_scheduled(self, bot: Bot) -> None:
-        """Har daqiqada chaqiriladi: vaqti kelgan foydalanuvchilarga yuboradi."""
+        """Har daqiqada chaqiriladi."""
+
         now = datetime.now(self._s.tz)
-        users = await self._db.users_due_for_delivery(now.date().isoformat(), now.strftime("%H:%M"))
+
+        users = await self._db.users_due_for_delivery(
+            now.date().isoformat(),
+            now.strftime("%H:%M"),
+        )
 
         for user in users:
             chat_id = user["chat_id"]
-            if self._cooldown.get(chat_id, 0) > time.monotonic():
+
+            # Yaqinda xato bo'lgan bo'lsa, qayta urinmaymiz
+            if self._cooldown.get(
+                chat_id,
+                0,
+            ) > time.monotonic():
                 continue
+
             try:
-                if not await self.deliver(bot, chat_id, scheduled=True):
-                    self._cooldown[chat_id] = time.monotonic() + RETRY_COOLDOWN
+                success = await self.deliver(
+                    bot,
+                    chat_id,
+                    scheduled=True,
+                )
+
+                if not success:
+                    self._cooldown[chat_id] = (
+                        time.monotonic()
+                        + RETRY_COOLDOWN
+                    )
+
             except Forbidden:
-                log.info("Foydalanuvchi %s botni bloklagan, o'chirib qo'yildi", chat_id)
-                await self._db.set_user_field(chat_id, active=0)
+                # Foydalanuvchi botni bloklagan.
+                # Faqat shu foydalanuvchi o'chiriladi.
+                # Bot ishlashda davom etadi.
+                log.info(
+                    "Foydalanuvchi %s botni bloklagan, "
+                    "o'chirib qo'yildi",
+                    chat_id,
+                )
+
+                await self._db.set_user_field(
+                    chat_id,
+                    active=0,
+                )
+
+                # Keyingi foydalanuvchiga o'tamiz
+                continue
+
             except RetryAfter as exc:
-                await asyncio.sleep(exc.retry_after)
+                log.warning(
+                    "Telegram limiti. %s soniya kutamiz.",
+                    exc.retry_after,
+                )
+
+                await asyncio.sleep(
+                    exc.retry_after
+                )
+
             except Exception:
-                log.exception("Foydalanuvchi %s uchun yuborishda xato", chat_id)
-                self._cooldown[chat_id] = time.monotonic() + RETRY_COOLDOWN
-            await asyncio.sleep(0.05)  # Telegram limitlariga hurmat
+                # Bitta foydalanuvchidagi xato
+                # butun scheduler'ni to'xtatmaydi.
+                log.exception(
+                    "Foydalanuvchi %s uchun "
+                    "yuborishda xato",
+                    chat_id,
+                )
+
+                self._cooldown[chat_id] = (
+                    time.monotonic()
+                    + RETRY_COOLDOWN
+                )
+
+                continue
+
+            # Telegram limitlariga hurmat
+            await asyncio.sleep(0.05)
